@@ -14,7 +14,7 @@ fn idx(val: &[u32], index: usize) -> u32 {
 }
 
 #[allow(unreachable_code)]
-#[spirv(compute(threads(128)))]
+#[spirv(compute(threads(512)))]
 pub fn main_cs(
     #[spirv(global_invocation_id)] id: UVec3,
     #[spirv(storage_buffer, descriptor_set = 0, binding = 0)] inputs: &[u32],

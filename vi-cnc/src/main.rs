@@ -46,7 +46,9 @@ mod test {
     }
 }
 
-async fn run() {
+// const RUNTIME_FACTOR_STR:&str = env!("RUNTIME_FACTOR");
+
+async fn run(factor: u32) {
     let state = SHA1_INITIAL_STATE;
     let mut final_block = [0u32; 16];
     // Put the nonce in the first 8 bytes = first 2 u32s
@@ -61,7 +63,7 @@ async fn run() {
         final_block,
         nonce_index: 0,
         nonce_start: 0,
-        nonce_end: 2_u64.pow(28),
+        nonce_end: 2_u64.pow(factor),
     };
 
     // dbg!(sha1_smol::DEFAULT_STATE);
@@ -106,7 +108,7 @@ async fn execute_gpu_inner(
 
     let cs_module = unsafe { device.create_shader_module_spirv(&sha1_shader) };
 
-    assert!(exec.num_executions() < u32::MAX.into());
+    assert!(exec.num_threads() < u32::MAX.into());
     let size = exec.num_threads() as wgpu::BufferAddress;
     let size = ((size >> 2) << 2) + 4;
 
@@ -197,7 +199,6 @@ async fn execute_gpu_inner(
         cpass.set_pipeline(&compute_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.insert_debug_marker("foobaridontknowwhattoputhere");
-        let num_workgroups = size / (vi_common::COMPUTE_THREADS as u64);
         cpass.dispatch_workgroups(exec.num_groups().try_into().unwrap(), 1, 1);
     }
 
@@ -256,6 +257,7 @@ async fn execute_gpu_inner(
 }
 
 fn main() {
+    let factor:u32 = std::env::args().skip(1).next().unwrap().parse().unwrap();
     env_logger::init();
-    pollster::block_on(run());
+    pollster::block_on(run(factor));
 }
