@@ -19,7 +19,15 @@ struct ExecutionDetails {
 
 impl ExecutionDetails {
     fn num_executions(self) -> u64 {
-        self.nonce_end.wrapping_sub(1).wrapping_sub(self.nonce_start)
+        self.nonce_end.wrapping_sub(self.nonce_start)
+    }
+
+    fn num_threads(self) -> u64 {
+        self.num_executions() / (vi_common::WORKER_LOOPS as u64)
+    }
+
+    fn num_groups(self) -> u64 {
+        self.num_threads() / (vi_common::COMPUTE_THREADS as u64)
     }
 }
 
@@ -53,12 +61,12 @@ async fn run() {
         final_block,
         nonce_index: 0,
         nonce_start: 0,
-        nonce_end: 1024*1024*128,
+        nonce_end: 2_u64.pow(28),
     };
 
-    dbg!(sha1_smol::DEFAULT_STATE);
-    sha1_smol::Sha1::from(&[0; 8]).digest_debug(true);
-    dbg!(exec);
+    // dbg!(sha1_smol::DEFAULT_STATE);
+    // sha1_smol::Sha1::from(&[0; 8]).digest_debug(true);
+    // dbg!(exec);
     let successful_nonces = execute_gpu(exec).await.unwrap();
 
     // dbg!(successful_nonces);
@@ -89,7 +97,6 @@ async fn execute_gpu(exec: ExecutionDetails) -> Option<Vec<u64>> {
     execute_gpu_inner(&device, &queue, exec).await
 }
 
-const SHA1_WG_SIZE:u32 = 512;
 async fn execute_gpu_inner(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -97,12 +104,13 @@ async fn execute_gpu_inner(
 ) -> Option<Vec<u64>> {
     let sha1_shader:wgpu::ShaderModuleDescriptorSpirV = wgpu::include_spirv_raw!(env!("vi_shaders.spv"));
 
-
     let cs_module = unsafe { device.create_shader_module_spirv(&sha1_shader) };
 
     assert!(exec.num_executions() < u32::MAX.into());
-    let size = exec.num_executions() as wgpu::BufferAddress;
+    let size = exec.num_threads() as wgpu::BufferAddress;
     let size = ((size >> 2) << 2) + 4;
+
+    let res_ty_size:u64 = std::mem::size_of::<vi_common::ResultInt>().try_into().unwrap();
 
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("results go here?"),
@@ -111,30 +119,22 @@ async fn execute_gpu_inner(
         mapped_at_creation: false,
     });
     
+    //output
     let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Storage Buffer"),
-        size,
+        size: size * res_ty_size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
 
-    // let mut input_bytes:Vec<u8> = Vec::new();
-
-    // input_bytes.extend_from_slice(exec.final_block.as_slice());
-    // for i in 0..5 {
-    //     input_bytes.extend_from_slice(exec.hashstate[i].to_ne_bytes().as_slice());
-    // }
-    // input_bytes.extend_from_slice(exec.nonce_start.to_ne_bytes().as_slice());
     let mut input_words:Vec<u32> = Vec::new();
-    // input_words.push(123);
     input_words.extend_from_slice(exec.final_block.as_slice());
     input_words.extend_from_slice(exec.hashstate.as_slice());
     input_words.push(0);
     input_words.push((exec.nonce_start >> 32) as u32);
     input_words.push((exec.nonce_start) as u32);
 
-    dbg!(&input_words);
-    // return Some(Vec::new());
+    // dbg!(&input_words);
 
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("da blokk"),
@@ -191,34 +191,14 @@ async fn execute_gpu_inner(
         entry_point: "main_cs",
     });
 
-    // Instantiates the bind group, once again specifying the binding of buffers.
-    // let bind_group_layout = compute_pipeline.get_bind_group_layout(1);
-    // let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    //     label: None,
-    //     layout: &bind_group_layout,
-    //     entries: &[wgpu::BindGroupEntry {
-    //         binding: 0,
-    //         resource: uniform_buffer.as_entire_binding(),
-    //     }, wgpu::BindGroupEntry {
-    //         binding: 1,
-    //         resource: staging_buffer.as_entire_binding(),
-    //     },],
-    // });
-
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{ label: None });
         cpass.set_pipeline(&compute_pipeline);
         cpass.set_bind_group(0, &bind_group, &[]);
         cpass.insert_debug_marker("foobaridontknowwhattoputhere");
-        let num_workgroups = (size / (SHA1_WG_SIZE as u64));
-        if num_workgroups <= 32768 {
-            cpass.dispatch_workgroups(num_workgroups as u32, 1, 1);
-        } else {
-            for _ in 0..(num_workgroups/32768) {
-                cpass.dispatch_workgroups(32768 as u32, 1, 1);
-            }
-        }
+        let num_workgroups = size / (vi_common::COMPUTE_THREADS as u64);
+        cpass.dispatch_workgroups(exec.num_groups().try_into().unwrap(), 1, 1);
     }
 
     encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
@@ -239,21 +219,25 @@ async fn execute_gpu_inner(
     if let Some(Ok(())) = receiver.receive().await {
         // Gets contents of buffer
         let data_bufferview = buffer_slice.get_mapped_range();
-        let data:&[u8] = &*data_bufferview;
-        dbg!(start.elapsed(), exec.num_executions());
+        let data:Vec<vi_common::ResultInt> = bytemuck::cast_slice(&data_bufferview).to_vec();
+        // let data:&[u8] = &*data_bufferview;
+        let el = start.elapsed();
+        dbg!(el, exec.num_executions());
+        eprintln!("{} MH/s", (exec.num_executions() as f32) / el.as_secs_f32() / 1_000_000.0);
         // dbg!(data);
         
         let result_scan_start = std::time::Instant::now();
         let mut res = Vec::new();
         for (i, v) in data.iter().enumerate() {
             if *v > 0 {
+                let nonce_inc:u64 = ((v-1) as u64) + (i as u64) * vi_common::WORKER_LOOPS as u64;
                 res.push(
-                    exec.nonce_start.wrapping_add(i as u64)
+                    exec.nonce_start.wrapping_add(nonce_inc)
                 );
             }
         }
         dbg!(result_scan_start.elapsed());
-        dbg!(&res);
+        // dbg!(&res);
 
         // With the current interface, we have to make sure all mapped views are
         // dropped before we unmap the buffer.

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "vi-cnc",
     "vi-shaders",
+    "vi-common",
 ]
 
 # Compile build-dependencies in release mode with

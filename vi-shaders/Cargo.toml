@@ -7,4 +7,5 @@ edition = "2021"
 crate-type = ["dylib", "lib"]
 
 [dependencies]
+vi-common = { path = "../vi-common" }
 spirv-std = { git = "https://github.com/EmbarkStudios/rust-gpu", features = ["glam"] }

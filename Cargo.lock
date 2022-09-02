@@ -109,6 +109,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1ad822118d20d2c234f427000d5acc36eabe1e29a348c89b63dd60b13f28e5d"
 
 [[package]]
+name = "bytemuck"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f5715e491b5a1598fc2bef5a606847b5dc1d48ea625bd3c02c00de8285591da"
+
+[[package]]
 name = "byteorder"
 version = "1.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -815,6 +821,7 @@ dependencies = [
 [[package]]
 name = "sha1_smol"
 version = "1.0.0"
+source = "git+https://github.com/shelvacu/sha1-smol#7655489f5be716ddfe41a1824ca30138c4f8152f"
 
 [[package]]
 name = "slotmap"
@@ -968,20 +975,27 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 name = "vi-cnc"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "env_logger",
  "futures-intrusive",
  "log",
  "pollster",
  "sha1_smol",
  "spirv-builder",
+ "vi-common",
  "wgpu",
 ]
+
+[[package]]
+name = "vi-common"
+version = "0.1.0"
 
 [[package]]
 name = "vi-shaders"
 version = "0.1.0"
 dependencies = [
  "spirv-std",
+ "vi-common",
 ]
 
 [[package]]
