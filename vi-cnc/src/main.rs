@@ -1,10 +1,7 @@
-#![feature(scoped_threads)]
-
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use pollster::FutureExt as _;
 use rand::Rng;
-// use parking_lot::Mutex;
-use std::sync::Arc;
 
 const SHA1_INITIAL_STATE:[u32; 5] = [
     0x67452301,
@@ -39,20 +36,41 @@ impl ExecutionDetails {
 
 #[cfg(test)]
 mod test {
+    use super::*;
     #[test]
     fn it_wraps() {
-        let n = ExecutionDetails{
-            hashstate: [0u32; 5],
-            final_block: [0u32; 16],
-            nonce_index: 0,
-            nonce_start: u64::MAX - 1,
-            nonce_end: 2,
-        };
-        assert_eq!(n, 3);
+        assert_eq!(
+            ExecutionDetails{
+                hashstate: [0u32; 5],
+                final_block: [0u32; 16],
+                nonce_index: 0,
+                nonce_start: 0,
+                nonce_end: 0,
+            }.num_executions(),
+            0
+        );
+        assert_eq!(
+            ExecutionDetails{
+                hashstate: [0u32; 5],
+                final_block: [0u32; 16],
+                nonce_index: 0,
+                nonce_start: 0,
+                nonce_end: 1,
+            }.num_executions(),
+            1
+        );
+        assert_eq!(
+            ExecutionDetails{
+                hashstate: [0u32; 5],
+                final_block: [0u32; 16],
+                nonce_index: 0,
+                nonce_start: u64::MAX - 1,
+                nonce_end: 2,
+            }.num_executions(),
+            4
+        );
     }
 }
-
-// const RUNTIME_FACTOR_STR:&str = env!("RUNTIME_FACTOR");
 
 fn run() {
     let state = SHA1_INITIAL_STATE;
@@ -62,7 +80,6 @@ fn run() {
     final_block[2] = 0x8000_0000;
     final_block[14] = (message_length >> 32) as u32;
     final_block[15] = message_length as u32;
-    // (&mut final_block[(63-8)..63]).copy_from_slice(message_length.to_be9_bytes().as_slice());
 
     let nonce_start:u64 = rand::thread_rng().gen();
     dbg!(nonce_start);
@@ -82,7 +99,7 @@ fn run() {
         for n in successful_nonces {
             println!("{:16x?}: {}", n, sha1_smol::Sha1::from(n.to_be_bytes()).hexdigest());
         }
-        count += PASS_SIZE;
+        count += vi_common::PASS_SIZE;
         if last_printout.elapsed() > std::time::Duration::from_secs(5) {
             let hps = (count as f32) / start.elapsed().as_secs_f32();
             println!("{:.2} MH/s", hps / 1_000_000f32);
@@ -90,14 +107,6 @@ fn run() {
         }
     });
 }
-
-// fn show(
-//     successful_nonces: Vec<u64>,
-// ) {
-//     for n in successful_nonces {
-//         println!("{:8x?}: {}", n, sha1_smol::Sha1::from(n.to_be_bytes()).hexdigest());
-//     }
-// }
 
 fn execute_gpu(
     exec: ExecutionDetails,
@@ -124,9 +133,6 @@ fn execute_gpu(
     execute_gpu_inner(device, queue, exec, nonce_start, callback);
 }
 
-// The number of hashes to compute in each compute pass
-const PASS_SIZE:u64 = 2_u64.pow(26);
-
 fn execute_gpu_inner(
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -142,7 +148,6 @@ fn execute_gpu_inner(
     let device_arc = Arc::new(device);
     let queue_arc = Arc::new(queue);
 
-    // let size = ((size >> 2) << 2) + 4;
     let (exec_send, exec_recv) = crossbeam::channel::bounded(8);
     let (resu_send, resu_recv) = crossbeam::channel::bounded(8);
     let mut threads = Vec::new();
@@ -151,7 +156,7 @@ fn execute_gpu_inner(
         loop {
             let mut new_exec = exec;
             new_exec.nonce_start = next_start_nonce;
-            next_start_nonce = next_start_nonce.wrapping_add(PASS_SIZE);
+            next_start_nonce = next_start_nonce.wrapping_add(vi_common::PASS_SIZE);
             new_exec.nonce_end = next_start_nonce;
             exec_send.send(new_exec).unwrap();
         }
@@ -218,8 +223,6 @@ fn execute_even_more_inner(
     input_words.push((exec.nonce_start >> 32) as u32);
     input_words.push((exec.nonce_start) as u32);
 
-    // dbg!(&input_words);
-
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("da blokk"),
         contents: unsafe{ std::slice::from_raw_parts(input_words.as_ptr() as *const u8, input_words.len() * 4) },
@@ -275,6 +278,7 @@ fn execute_even_more_inner(
         entry_point: "main_cs",
     });
 
+    // Remember, each method on encoder is "recording" a set of steps to be done, and not doing them until later
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{ label: None });
@@ -283,31 +287,23 @@ fn execute_even_more_inner(
         cpass.insert_debug_marker("foobaridontknowwhattoputhere");
         cpass.dispatch_workgroups(exec.num_groups().try_into().unwrap(), 1, 1);
     }
-
     encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, result_bytesize);
-    // let start = std::time::Instant::now();
+
     queue.submit(Some(encoder.finish()));
 
     let buffer_slice = staging_buffer.slice(..);
-    // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
-    // let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    // Sets the buffer up for mapping. The example code had this sending over a channel, but I don't think we need to do that.
     buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
 
     // Poll the device in a blocking manner so that our future resolves.
-    // In an actual application, `device.poll(...)` should
-    // be called in an event loop or on another thread.
+    // Supposedly "In an actual application, `device.poll(...)` should be called in an event loop or on another thread."
+    // But why?
     device.poll(wgpu::Maintain::Wait);
 
     // Gets contents of buffer
     let data_bufferview = buffer_slice.get_mapped_range();
     let data:Vec<vi_common::ResultInt> = bytemuck::cast_slice(&data_bufferview).to_vec();
-    // let data:&[u8] = &*data_bufferview;
-    // let el = start.elapsed();
-    // dbg!(el, exec.num_executions());
-    // eprintln!("{} MH/s", (exec.num_executions() as f32) / el.as_secs_f32() / 1_000_000.0);
-    // dbg!(data);
-    
-    // let result_scan_start = std::time::Instant::now();
+
     let mut res = Vec::new();
     for (i, v) in data.iter().enumerate() {
         if *v > 0 {
@@ -317,20 +313,13 @@ fn execute_even_more_inner(
             );
         }
     }
-    // dbg!(result_scan_start.elapsed());
-    // dbg!(&res);
 
     // With the current interface, we have to make sure all mapped views are
     // dropped before we unmap the buffer.
     drop(data);
     drop(data_bufferview);
-    staging_buffer.unmap(); // Unmaps buffer from memory
-                            // If you are familiar with C++ these 2 lines can be thought of similarly to:
-                            //   delete myPointer;
-                            //   myPointer = NULL;
-                            // It effectively frees the memory
+    staging_buffer.unmap(); // Unmaps buffer from memory. This does something different from drop, but I don't understand why.
 
-    // Returns data from buffer
     res
 }
 

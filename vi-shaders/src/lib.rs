@@ -8,6 +8,8 @@
 #![deny(warnings)]
 
 use spirv_std::glam::UVec3;
+#[cfg(not(target_arch = "spirv"))]
+use spirv_std::macros::spirv;
 
 fn idx(val: &[u32], index: usize) -> u32 {
     val[index]
@@ -141,8 +143,6 @@ pub fn main_cs(
 
     results[index as usize] = my_res as vi_common::ResultInt;
 }
-
-
 
 
 const fn rol(value: u32, bits: usize) -> u32 {
