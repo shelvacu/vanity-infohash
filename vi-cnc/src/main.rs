@@ -1,4 +1,10 @@
+#![feature(scoped_threads)]
+
 use wgpu::util::DeviceExt;
+use pollster::FutureExt as _;
+use rand::Rng;
+// use parking_lot::Mutex;
+use std::sync::Arc;
 
 const SHA1_INITIAL_STATE:[u32; 5] = [
     0x67452301,
@@ -48,7 +54,7 @@ mod test {
 
 // const RUNTIME_FACTOR_STR:&str = env!("RUNTIME_FACTOR");
 
-async fn run(factor: u32) {
+fn run() {
     let state = SHA1_INITIAL_STATE;
     let mut final_block = [0u32; 16];
     // Put the nonce in the first 8 bytes = first 2 u32s
@@ -58,33 +64,52 @@ async fn run(factor: u32) {
     final_block[15] = message_length as u32;
     // (&mut final_block[(63-8)..63]).copy_from_slice(message_length.to_be9_bytes().as_slice());
 
+    let nonce_start:u64 = rand::thread_rng().gen();
+    dbg!(nonce_start);
+
     let exec = ExecutionDetails {
         hashstate: state,
         final_block,
         nonce_index: 0,
-        nonce_start: 0,
-        nonce_end: 2_u64.pow(factor),
+        nonce_start,
+        nonce_end: 0, //to be filled in later
     };
 
-    // dbg!(sha1_smol::DEFAULT_STATE);
-    // sha1_smol::Sha1::from(&[0; 8]).digest_debug(true);
-    // dbg!(exec);
-    let successful_nonces = execute_gpu(exec).await.unwrap();
-
-    // dbg!(successful_nonces);
-    //println!("{:x?}", successful_nonces);
-    for n in successful_nonces {
-        println!("{:8x?}: {}", n, sha1_smol::Sha1::from(n.to_be_bytes()).hexdigest());
-    }
+    let start = std::time::Instant::now();
+    let mut last_printout = std::time::Instant::now();
+    let mut count:u64 = 0;
+    execute_gpu(exec, nonce_start, move |successful_nonces| {
+        for n in successful_nonces {
+            println!("{:16x?}: {}", n, sha1_smol::Sha1::from(n.to_be_bytes()).hexdigest());
+        }
+        count += PASS_SIZE;
+        if last_printout.elapsed() > std::time::Duration::from_secs(5) {
+            let hps = (count as f32) / start.elapsed().as_secs_f32();
+            println!("{:.2} MH/s", hps / 1_000_000f32);
+            last_printout = std::time::Instant::now();
+        }
+    });
 }
 
-async fn execute_gpu(exec: ExecutionDetails) -> Option<Vec<u64>> {
+// fn show(
+//     successful_nonces: Vec<u64>,
+// ) {
+//     for n in successful_nonces {
+//         println!("{:8x?}: {}", n, sha1_smol::Sha1::from(n.to_be_bytes()).hexdigest());
+//     }
+// }
+
+fn execute_gpu(
+    exec: ExecutionDetails,
+    nonce_start: u64,
+    callback: impl FnMut(Vec<u64>) + std::marker::Send + 'static,
+) {
     let instance = wgpu::Instance::new(wgpu::Backends::VULKAN);
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions{
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
-    }).await?;
+    }).block_on().unwrap();
 
     let (device, queue) = adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -93,30 +118,87 @@ async fn execute_gpu(exec: ExecutionDetails) -> Option<Vec<u64>> {
             limits: wgpu::Limits::downlevel_defaults(),
         },
         None,
-    ).await.unwrap();
+    ).block_on().unwrap();
     dbg!(adapter.get_info());
 
-    execute_gpu_inner(&device, &queue, exec).await
+    execute_gpu_inner(device, queue, exec, nonce_start, callback);
 }
 
-async fn execute_gpu_inner(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+// The number of hashes to compute in each compute pass
+const PASS_SIZE:u64 = 2_u64.pow(26);
+
+fn execute_gpu_inner(
+    device: wgpu::Device,
+    queue: wgpu::Queue,
     exec: ExecutionDetails,
-) -> Option<Vec<u64>> {
+    nonce_start: u64,
+    mut callback: impl FnMut(Vec<u64>) + std::marker::Send + 'static,
+) {
     let sha1_shader:wgpu::ShaderModuleDescriptorSpirV = wgpu::include_spirv_raw!(env!("vi_shaders.spv"));
 
     let cs_module = unsafe { device.create_shader_module_spirv(&sha1_shader) };
+    let cs_module_arc = Arc::new(cs_module);
 
+    let device_arc = Arc::new(device);
+    let queue_arc = Arc::new(queue);
+
+    // let size = ((size >> 2) << 2) + 4;
+    let (exec_send, exec_recv) = crossbeam::channel::bounded(8);
+    let (resu_send, resu_recv) = crossbeam::channel::bounded(8);
+    let mut threads = Vec::new();
+    threads.push(std::thread::spawn(move || {
+        let mut next_start_nonce = nonce_start;
+        loop {
+            let mut new_exec = exec;
+            new_exec.nonce_start = next_start_nonce;
+            next_start_nonce = next_start_nonce.wrapping_add(PASS_SIZE);
+            new_exec.nonce_end = next_start_nonce;
+            exec_send.send(new_exec).unwrap();
+        }
+    }));
+    for _ in 0..4 {
+        let my_recv = exec_recv.clone();
+        let my_send = resu_send.clone();
+        let my_device = Arc::clone(&device_arc);
+        let my_queue = Arc::clone(&queue_arc);
+        let my_module = Arc::clone(&cs_module_arc);
+        threads.push(std::thread::spawn(move || {
+            loop {
+                let exec = my_recv.recv().unwrap();
+                let res = execute_even_more_inner(
+                    &*my_device,
+                    &*my_queue,
+                    &*my_module,
+                    exec,
+                );
+                my_send.send(res).unwrap();
+            }
+        }));
+    }
+    threads.push(std::thread::spawn(move || {
+        loop {
+            callback(resu_recv.recv().unwrap());
+        }
+    }));
+
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+
+fn execute_even_more_inner(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cs_module: &wgpu::ShaderModule,
+    exec: ExecutionDetails,
+) -> Vec<u64> {
     assert!(exec.num_threads() < u32::MAX.into());
-    let size = exec.num_threads() as wgpu::BufferAddress;
-    let size = ((size >> 2) << 2) + 4;
-
+    let thing = exec.num_threads() as wgpu::BufferAddress;
     let res_ty_size:u64 = std::mem::size_of::<vi_common::ResultInt>().try_into().unwrap();
-
+    let result_bytesize = thing * res_ty_size;
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("results go here?"),
-        size,
+        size: result_bytesize,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -124,7 +206,7 @@ async fn execute_gpu_inner(
     //output
     let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Storage Buffer"),
-        size: size * res_ty_size,
+        size: result_bytesize,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -202,62 +284,57 @@ async fn execute_gpu_inner(
         cpass.dispatch_workgroups(exec.num_groups().try_into().unwrap(), 1, 1);
     }
 
-    encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, size);
-    let start = std::time::Instant::now();
+    encoder.copy_buffer_to_buffer(&storage_buffer, 0, &staging_buffer, 0, result_bytesize);
+    // let start = std::time::Instant::now();
     queue.submit(Some(encoder.finish()));
 
     let buffer_slice = staging_buffer.slice(..);
     // Sets the buffer up for mapping, sending over the result of the mapping back to us when it is finished.
-    let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-    buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+    // let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
 
     // Poll the device in a blocking manner so that our future resolves.
     // In an actual application, `device.poll(...)` should
     // be called in an event loop or on another thread.
     device.poll(wgpu::Maintain::Wait);
 
-    // Awaits until `buffer_future` can be read from
-    if let Some(Ok(())) = receiver.receive().await {
-        // Gets contents of buffer
-        let data_bufferview = buffer_slice.get_mapped_range();
-        let data:Vec<vi_common::ResultInt> = bytemuck::cast_slice(&data_bufferview).to_vec();
-        // let data:&[u8] = &*data_bufferview;
-        let el = start.elapsed();
-        dbg!(el, exec.num_executions());
-        eprintln!("{} MH/s", (exec.num_executions() as f32) / el.as_secs_f32() / 1_000_000.0);
-        // dbg!(data);
-        
-        let result_scan_start = std::time::Instant::now();
-        let mut res = Vec::new();
-        for (i, v) in data.iter().enumerate() {
-            if *v > 0 {
-                let nonce_inc:u64 = ((v-1) as u64) + (i as u64) * vi_common::WORKER_LOOPS as u64;
-                res.push(
-                    exec.nonce_start.wrapping_add(nonce_inc)
-                );
-            }
+    // Gets contents of buffer
+    let data_bufferview = buffer_slice.get_mapped_range();
+    let data:Vec<vi_common::ResultInt> = bytemuck::cast_slice(&data_bufferview).to_vec();
+    // let data:&[u8] = &*data_bufferview;
+    // let el = start.elapsed();
+    // dbg!(el, exec.num_executions());
+    // eprintln!("{} MH/s", (exec.num_executions() as f32) / el.as_secs_f32() / 1_000_000.0);
+    // dbg!(data);
+    
+    // let result_scan_start = std::time::Instant::now();
+    let mut res = Vec::new();
+    for (i, v) in data.iter().enumerate() {
+        if *v > 0 {
+            let nonce_inc:u64 = ((v-1) as u64) + (i as u64) * vi_common::WORKER_LOOPS as u64;
+            res.push(
+                exec.nonce_start.wrapping_add(nonce_inc)
+            );
         }
-        dbg!(result_scan_start.elapsed());
-        // dbg!(&res);
-
-        // With the current interface, we have to make sure all mapped views are
-        // dropped before we unmap the buffer.
-        drop(data);
-        // staging_buffer.unmap(); // Unmaps buffer from memory
-                                // If you are familiar with C++ these 2 lines can be thought of similarly to:
-                                //   delete myPointer;
-                                //   myPointer = NULL;
-                                // It effectively frees the memory
-
-        // Returns data from buffer
-        Some(res)
-    } else {
-        panic!("failed to run compute on gpu!")
     }
+    // dbg!(result_scan_start.elapsed());
+    // dbg!(&res);
+
+    // With the current interface, we have to make sure all mapped views are
+    // dropped before we unmap the buffer.
+    drop(data);
+    drop(data_bufferview);
+    staging_buffer.unmap(); // Unmaps buffer from memory
+                            // If you are familiar with C++ these 2 lines can be thought of similarly to:
+                            //   delete myPointer;
+                            //   myPointer = NULL;
+                            // It effectively frees the memory
+
+    // Returns data from buffer
+    res
 }
 
 fn main() {
-    let factor:u32 = std::env::args().skip(1).next().unwrap().parse().unwrap();
     env_logger::init();
-    pollster::block_on(run(factor));
+    run();
 }

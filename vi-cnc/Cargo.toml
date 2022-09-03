@@ -13,6 +13,8 @@ pollster = "0.2.5"
 sha1_smol = { git = "https://github.com/shelvacu/sha1-smol", features = ["std"] }
 wgpu = { version = "0.13.1", features = ["spirv"] }
 bytemuck = "1.12.1"
+crossbeam = { version = "0.8.2", features = ["crossbeam-channel"] }
+rand = "0.8.5"
 
 [build-dependencies]
 spirv-builder = { git = "https://github.com/EmbarkStudios/rust-gpu" }

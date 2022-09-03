@@ -134,7 +134,7 @@ pub fn main_cs(
         state[3] = state[3].wrapping_add(d);
         state[4] = state[4].wrapping_add(e);
         let result_h0 = state[0];
-        if (result_h0 >> 6) == 0x0000_0000 {
+        if (result_h0 >> 0) == 0x0000_0000 {
             my_res = loop_i + 1;
         }
     }
